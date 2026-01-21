@@ -4,6 +4,7 @@ import sys
 import os
 import re
 import subprocess
+import math
 from pathlib import Path
 
 # Local installation paths
@@ -311,9 +312,29 @@ async def scrape_leaf_table(page, path, url):
     for row in rows:
         all_rows.append((path.copy(), row))
 
+async def fetch_with_retry(page, url, max_retries=5, delay_on_rate_limit=30):
+    """
+    Navigate to a URL with rate-limit protection (HTTP 429).
+    Returns the response object.
+    """
+    retries = 0
+    while retries < max_retries:
+        response = await page.goto(url)
+        await page.wait_for_load_state("networkidle")
+        
+        if response.status != 429:
+            return response
+
+        print(f"[WARNING] Rate limited at {url}! Sleeping {delay_on_rate_limit}s...")
+        await asyncio.sleep(delay_on_rate_limit)
+        retries += 1
+
+    print(f"[ERROR] Max retries reached for {url}.")
+    return None
+
 
 # --- CONFIG FLAG ---
-TEST_FIRST_TOP_CATEGORY_ONLY = False  # Set False to explore all top-level categories
+TEST_FIRST_TOP_CATEGORY_ONLY = True  # Set False to explore all top-level categories
 
 async def explore_category(page, url, path=None, is_top_level=False):
     if path is None:
@@ -321,13 +342,10 @@ async def explore_category(page, url, path=None, is_top_level=False):
 
     await asyncio.sleep(random.uniform(1.5, 3.0))  # random delay
 
-    response = await page.goto(url)
-    await page.wait_for_load_state("networkidle")
-
-    if response.status == 429:
-        print("[WARNING] Rate limited! Sleeping 30 seconds...")
-        await asyncio.sleep(30)
-        return await explore_category(page, url, path, is_top_level)
+    response = await fetch_with_retry(page, url)
+    if response is None:
+        print("[ERROR] Could not reach the sales page due to rate limiting.")
+        return
 
     if page.is_closed():
         print("[ERROR] Page was closed unexpectedly.")
@@ -418,11 +436,13 @@ async def stock_process(page):
 
 
 async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pdf"):
-    # Use existing context
     page = await context.new_page()
-    print(f"[INFO] Navigating to {receipt_url}")
-    await page.goto(receipt_url)
-    await page.wait_for_load_state("networkidle")
+    response = await fetch_with_retry(page, receipt_url)
+    if response is None:
+        print(f"[ERROR] Could not navigate to {receipt_url} due to rate limiting.")
+        await page.close()
+        return
+
     print(f"[INFO] Saving PDF to {pdf_path}")
     await page.pdf(
         path=pdf_path,
@@ -435,19 +455,49 @@ async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pd
 
 
 async def stock_process_sales(page, csv_file):
-    """Read CSV, print Barserials, then navigate to a NOSPOS page and save receipt PDF."""
+    """Read CSV, log Barserial, Quantity, Cost, and Cost per unit.
+       Subdivide rows with Quantity > 1 into exact 1-unit rows for logging purposes."""
+    
     print(f"[INFO] Reading sales CSV: {csv_file}")
     try:
         with open(csv_file, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            if "Barserial" not in reader.fieldnames:
-                print("[WARNING] CSV does not contain a 'Barserial' column.")
-                return
+            required_columns = ["Barserial", "Quantity", "Cost"]
+            for col in required_columns:
+                if col not in reader.fieldnames:
+                    print(f"[WARNING] CSV does not contain a '{col}' column.")
+                    return
 
             barserials = []
+
             for i, row in enumerate(reader, start=1):
-                barserial = row.get("Barserial", "")
-                print(f"Row {i}: Barserial = {barserial}")
+                barserial = row.get("Barserial", "").strip()
+                quantity_str = row.get("Quantity", "0").strip()
+                cost_str = row.get("Cost", "0").strip()
+
+                # Helper to parse numbers
+                def parse_number(s):
+                    s_clean = re.sub(r"[£,]", "", s)
+                    try:
+                        return float(s_clean)
+                    except ValueError:
+                        print(f"[WARNING] Invalid number '{s}' at row {i}, defaulting to 0.")
+                        return 0.0
+
+                quantity = parse_number(quantity_str)
+                cost = parse_number(cost_str)
+
+                # Calculate cost per unit
+                cost_per_unit = cost / quantity if quantity != 0 else 0
+
+                # Handle subdivision if quantity > 1
+                if quantity > 1:
+                    print(f"Row {i}: Barserial = {barserial}, Quantity = {quantity}, Cost = {cost}, Cost per unit = {cost_per_unit:.2f} (subdivided into {int(quantity)} rows)")
+                    for j in range(int(quantity)):
+                        print(f"  Subdivided Row {i}.{j+1}: Barserial = {barserial}, Quantity = 1, Cost = {cost_per_unit:.2f}")
+                else:
+                    print(f"Row {i}: Barserial = {barserial}, Quantity = {quantity}, Cost = {cost}, Cost per unit = {cost_per_unit:.2f}")
+
                 if barserial:
                     barserials.append(barserial)
 
@@ -460,13 +510,12 @@ async def stock_process_sales(page, csv_file):
 
     # --- Navigate to the NOSPOS page ---
     target_url = "https://nospos.com/newsales/cart/46064/view"
-
-    # print(f"[INFO] Navigating to {target_url} ...")
     # await page.goto(target_url)
     # await page.wait_for_load_state("networkidle")
-    # print(f"[INFO] Arrived at {target_url}.")
     
     await save_receipt_pdf_in_context(page.context, "https://nospos.com/print/sale-receipt?id=46064")
+
+
 
 
 
