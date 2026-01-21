@@ -417,6 +417,58 @@ async def stock_process(page):
     print(f"[INFO] Scraping complete. CSV saved as {CSV_FILE}")
 
 
+async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pdf"):
+    # Use existing context
+    page = await context.new_page()
+    print(f"[INFO] Navigating to {receipt_url}")
+    await page.goto(receipt_url)
+    await page.wait_for_load_state("networkidle")
+    print(f"[INFO] Saving PDF to {pdf_path}")
+    await page.pdf(
+        path=pdf_path,
+        format="A4",
+        print_background=True,
+        margin={"top": "10mm", "bottom": "10mm"}
+    )
+    await page.close()
+    print("[INFO] PDF saved successfully.")
+
+
+async def stock_process_sales(page, csv_file):
+    """Read CSV, print Barserials, then navigate to a NOSPOS page and save receipt PDF."""
+    print(f"[INFO] Reading sales CSV: {csv_file}")
+    try:
+        with open(csv_file, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if "Barserial" not in reader.fieldnames:
+                print("[WARNING] CSV does not contain a 'Barserial' column.")
+                return
+
+            barserials = []
+            for i, row in enumerate(reader, start=1):
+                barserial = row.get("Barserial", "")
+                print(f"Row {i}: Barserial = {barserial}")
+                if barserial:
+                    barserials.append(barserial)
+
+    except FileNotFoundError:
+        print(f"[ERROR] CSV file not found: {csv_file}")
+        return
+    except Exception as e:
+        print(f"[ERROR] Failed to read CSV: {e}")
+        return
+
+    # --- Navigate to the NOSPOS page ---
+    target_url = "https://nospos.com/newsales/cart/46064/view"
+
+    # print(f"[INFO] Navigating to {target_url} ...")
+    # await page.goto(target_url)
+    # await page.wait_for_load_state("networkidle")
+    # print(f"[INFO] Arrived at {target_url}.")
+    
+    await save_receipt_pdf_in_context(page.context, "https://nospos.com/print/sale-receipt?id=46064")
+
+
 
 async def main():
     if len(sys.argv) < 2:
@@ -424,11 +476,13 @@ async def main():
         print("Usage:")
         print("  python script.py take <TAKE_ID>")
         print("  python script.py stock_process")
+        print("  python script.py stock_process_sales <CSV_FILE>")
         return
 
     mode = sys.argv[1].lower()
 
     take_id = None
+    csv_file = None
     if mode == "take":
         if len(sys.argv) < 3:
             print("[ERROR] TAKE mode requires a TAKE ID.")
@@ -436,6 +490,11 @@ async def main():
         take_id = sys.argv[2]
     elif mode == "stock_process":
         pass
+    elif mode == "stock_process_sales":
+        if len(sys.argv) < 3:
+            print("[ERROR] stock_process_sales mode requires a CSV file path.")
+            return
+        csv_file = sys.argv[2]
     else:
         print(f"[ERROR] Unknown mode: {mode}")
         return
@@ -449,16 +508,21 @@ async def main():
         )
         page = await browser.new_page()
 
+        # Wait for login first
         logged_in = await wait_for_login(page)
         if not logged_in:
             return
 
+        # After login
+        if csv_file:
+            await stock_process_sales(page, csv_file)
         if mode == "take":
             await navigate_to_take(page, take_id)
         elif mode == "stock_process":
             await stock_process(page)
 
         print("[INFO] Done.")
+
 
 
 if __name__ == "__main__":
