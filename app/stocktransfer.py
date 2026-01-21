@@ -261,13 +261,183 @@ async def navigate_to_take(page, take_id):
 
     return missing_items
 
+import csv
+import random
+import asyncio
+
+CSV_FILE = "stock_data.csv"
+MAX_CATEGORY_DEPTH = 0  # will track maximum category depth dynamically
+
+# Store rows temporarily so we can compute max depth before writing
+all_rows = []
+
+async def scrape_leaf_table(page, path, url):
+    global MAX_CATEGORY_DEPTH, all_rows
+
+    MAX_CATEGORY_DEPTH = max(MAX_CATEGORY_DEPTH, len(path))
+
+    print(f"[LEAF] Scraping leaf table at path: {' > '.join(path)}")
+    await page.goto(url)
+    await page.wait_for_load_state("networkidle")
+    await asyncio.sleep(random.uniform(1, 2))  # polite delay
+
+    # Detect headers
+    headers = await page.evaluate("""
+        () => {
+            const ths = document.querySelectorAll('#stock-valuation-table > table > thead > tr > th');
+            return Array.from(ths).map(th => th.textContent.trim());
+        }
+    """)
+
+    if not headers or headers[0].lower() != "barserial":
+        print(f"[WARNING] Expected Barserial table, got different headers at {url}")
+        return
+
+    # Extract rows
+    rows = await page.evaluate("""
+        () => {
+            const trs = document.querySelectorAll('#stock-valuation-table > table > tbody > tr');
+            return Array.from(trs).map(tr => {
+                return Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+            });
+        }
+    """)
+
+    if not rows:
+        print(f"[WARNING] No rows found in leaf table at {url}")
+        return
+
+    # Store rows temporarily with category path
+    for row in rows:
+        all_rows.append((path.copy(), row))
+
+
+# --- CONFIG FLAG ---
+TEST_FIRST_TOP_CATEGORY_ONLY = False  # Set False to explore all top-level categories
+
+async def explore_category(page, url, path=None, is_top_level=False):
+    if path is None:
+        path = []
+
+    await asyncio.sleep(random.uniform(1.5, 3.0))  # random delay
+
+    response = await page.goto(url)
+    await page.wait_for_load_state("networkidle")
+
+    if response.status == 429:
+        print("[WARNING] Rate limited! Sleeping 30 seconds...")
+        await asyncio.sleep(30)
+        return await explore_category(page, url, path, is_top_level)
+
+    if page.is_closed():
+        print("[ERROR] Page was closed unexpectedly.")
+        return
+
+    table_type = await page.evaluate("""
+        () => {
+            const th = document.querySelector('#stock-valuation-table > table > thead > tr > th');
+            return th ? th.textContent.trim() : null;
+        }
+    """)
+
+    if table_type is None:
+        # Check if table exists but contains only "No results"
+        empty_table = await page.evaluate("""
+            () => {
+                const td = document.querySelector('#stock-valuation-table > table > tbody > tr > td');
+                if (!td) return false;
+                return /no/i.test(td.textContent.trim());
+            }
+        """)
+
+        if empty_table:
+            print(f"[INFO] Empty table detected at {url}, adding category path only.")
+            # Add a row with empty leaf columns
+            leaf_headers = ["Barserial", "Name", "Quantity", "Retail", "Cost", "VAT", "Net", "Total Margin", "Margin %"]
+            all_rows.append((path.copy(), [""] * len(leaf_headers)))
+        else:
+            print(f"[WARNING] No table found at {url}")
+        return
+
+
+    if table_type.lower() == "barserial":
+        await scrape_leaf_table(page, path, url)
+        return
+
+    # Category table: extract subcategories
+    subcategories = await page.evaluate("""
+        () => {
+            const rows = document.querySelectorAll('#stock-valuation-table > table > tbody > tr');
+            return Array.from(rows).map(row => {
+                const link = row.querySelector('td:first-child a');
+                if (!link) return null;
+                return {
+                    name: link.textContent.trim(),
+                    url: link.href
+                };
+            }).filter(Boolean);
+        }
+    """)
+
+    if not subcategories:
+        print(f"[WARNING] No subcategories found at {url}")
+        return
+
+    for i, subcat in enumerate(subcategories):
+        # Only restrict at the top-level
+        if is_top_level and TEST_FIRST_TOP_CATEGORY_ONLY and i > 0:
+            print("[INFO] TEST MODE: only exploring first top-level category, skipping the rest.")
+            break
+
+        # Recurse; all lower levels explored fully
+        await explore_category(page, subcat["url"], path + [subcat["name"]], is_top_level=False)
+
+
+
+async def stock_process(page):
+    top_url = "https://nospos.com/reports/stock/category-valuation"
+    global MAX_CATEGORY_DEPTH, all_rows
+
+    # Recursively traverse and scrape
+    await explore_category(page, top_url, is_top_level=True)
+
+    # Prepare CSV headers
+    category_headers = [f"Category Level {i+1}" for i in range(MAX_CATEGORY_DEPTH)]
+    leaf_headers = ["Barserial", "Name", "Quantity", "Retail", "Cost", "VAT", "Net", "Total Margin", "Margin %"]
+    headers = category_headers + leaf_headers
+
+    # Write to CSV
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for path, row in all_rows:
+            padded_path = path + [""] * (MAX_CATEGORY_DEPTH - len(path))
+            writer.writerow(padded_path + row)
+
+    print(f"[INFO] Scraping complete. CSV saved as {CSV_FILE}")
+
+
 
 async def main():
-    # --- Prompt user first ---
-    try:
-        take_id = input("Enter TAKE ID: ").strip()
-    except KeyboardInterrupt:
-        print("\n[INFO] Aborted by user.")
+    if len(sys.argv) < 2:
+        print("[ERROR] Missing mode.")
+        print("Usage:")
+        print("  python script.py take <TAKE_ID>")
+        print("  python script.py stock_process")
+        return
+
+    mode = sys.argv[1].lower()
+
+    take_id = None
+    if mode == "take":
+        if len(sys.argv) < 3:
+            print("[ERROR] TAKE mode requires a TAKE ID.")
+            return
+        take_id = sys.argv[2]
+    elif mode == "stock_process":
+        pass
+    else:
+        print(f"[ERROR] Unknown mode: {mode}")
         return
 
     async with async_playwright() as pw:
@@ -283,9 +453,12 @@ async def main():
         if not logged_in:
             return
 
-        await navigate_to_take(page, take_id)
+        if mode == "take":
+            await navigate_to_take(page, take_id)
+        elif mode == "stock_process":
+            await stock_process(page)
 
-        print("[INFO] Ready for further automation.")
+        print("[INFO] Done.")
 
 
 if __name__ == "__main__":

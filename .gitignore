@@ -1,0 +1,6 @@
+.csv
+app/app
+python/
+app/playwright_user_data
+app/.dependencies_installed
+__pycache__/
