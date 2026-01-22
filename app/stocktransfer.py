@@ -683,7 +683,7 @@ async def stock_process_sales(page, csv_file):
         return
 
     # Process units in batches of 20
-    await open_cart_items_per_unit(page, units, batch_size=5)
+    await open_cart_items_per_unit(page, units, batch_size=20)
 
 
 async def main():
