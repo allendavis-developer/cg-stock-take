@@ -455,23 +455,33 @@ async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pd
 
     
 
-async def open_cart_items_per_unit(page, units, cart_id=46065):
+async def open_cart_items_per_unit(page, units, cart_id=46077, batch_size=20):
     """
     units: list of tuples (barcode, cost_per_unit)
+    batch_size: number of items to add to cart before updating price
     """
     base_url = f"https://nospos.com/newsales/cart/{cart_id}/items"
     update_url = f"https://nospos.com/newsales/cart/{cart_id}/items/update"
 
-    for i, (barserial, cost_per_unit) in enumerate(units, start=1):
-        print(f"[INFO] Unit {i}/{len(units)}: processing barcode {barserial} with cost {cost_per_unit:.2f}")
+    i = 0
+    while i < len(units):
+        # Calculate batch end index
+        batch_end = min(i + batch_size, len(units))
+        batch = units[i:batch_end]
+        batch_num = (i // batch_size) + 1
+        
+        print(f"\n[INFO] Processing batch {batch_num}: items {i+1} to {batch_end} of {len(units)}")
 
+        # Navigate to cart page
         response = await fetch_with_retry(page, base_url)
         if response is None:
             print("[ERROR] Failed to load cart page.")
+            i = batch_end
             continue
 
         await page.wait_for_load_state("networkidle")
 
+        # Clear cart before starting new batch
         clear_button = page.locator(
             f'a[href="/newsales/cart/{cart_id}/items/delete"]:has-text("Clear")'
         )
@@ -483,40 +493,81 @@ async def open_cart_items_per_unit(page, units, cart_id=46065):
             await page.wait_for_load_state("networkidle")
             print("[INFO] Cart cleared.")
 
-        # ---- ENTER BARCODE ----
+        # Group batch items by barcode
+        from collections import defaultdict
+        grouped_items = defaultdict(list)
+        for barserial, cost_per_unit in batch:
+            grouped_items[barserial].append(cost_per_unit)
+        
+        print(f"[INFO] Batch has {len(grouped_items)} unique barcodes")
+
+        # Add each unique barcode once to the cart
         barcode_input = page.locator("#stocksearch-search_barserial")
-        await barcode_input.wait_for(state="visible", timeout=5000)
-        await barcode_input.fill(barserial)
-        await barcode_input.press("Enter")
-        await page.wait_for_load_state("networkidle")
-        print(f"[INFO] Barcode {barserial} entered.")
+        
+        for barserial in grouped_items.keys():
+            quantity = len(grouped_items[barserial])
+            print(f"[INFO] Adding barcode {barserial} (will have quantity {quantity})")
+            
+            await barcode_input.wait_for(state="visible", timeout=5000)
+            await barcode_input.fill(barserial)
+            await barcode_input.press("Enter")
+            await page.wait_for_load_state("networkidle")
 
         # ---- GO TO UPDATE/DISCOUNT PAGE ----
         await page.goto(update_url)
         await page.wait_for_load_state("networkidle")
-        print(f"[INFO] On update page for barcode {barserial}.")
+        print(f"[INFO] On update page for batch.")
 
-        # ---- ENTER PRICE ----
-        price_input = page.locator("#cartitems-0-price")
-        await price_input.wait_for(state="visible", timeout=5000)
-        await price_input.fill(f"{cost_per_unit:.2f}")
-        print(f"[INFO] Entered price: {cost_per_unit:.2f}")
-
-        # ---- ENTER DISCOUNT REASON ----
-        discount_input = page.locator("#cartitems-0-discount_reason")
-        await discount_input.wait_for(state="visible", timeout=5000)
-        await discount_input.fill("testing")
-        print(f"[INFO] Entered discount reason: testing")
+        # ---- ENTER PRICE, QUANTITY, AND DISCOUNT REASON FOR EACH UNIQUE BARCODE ----
+        for idx, barserial in enumerate(grouped_items.keys()):
+            costs = grouped_items[barserial]
+            quantity = len(costs)
+            # All units of the same barcode should have the same cost_per_unit
+            cost_per_unit = costs[0]
+            
+            print(f"[INFO] Item {idx}: {barserial} - Qty: {quantity}, Cost/Unit: {cost_per_unit:.2f}")
+            
+            # Update quantity for this cart item
+            quantity_input = page.locator(f"#cartitems-{idx}-quantity")
+            await quantity_input.wait_for(state="visible", timeout=5000)
+            await quantity_input.fill(str(quantity))
+            
+            # Update price (cost per unit - website will calculate total automatically)
+            price_input = page.locator(f"#cartitems-{idx}-price")
+            await price_input.wait_for(state="visible", timeout=5000)
+            await price_input.fill(f"{cost_per_unit:.2f}")
+            
+            # Update discount reason
+            discount_input = page.locator(f"#cartitems-{idx}-discount_reason")
+            await discount_input.wait_for(state="visible", timeout=5000)
+            await discount_input.fill("testing")
+            
+            print(f"[INFO] Set item {idx}: Qty={quantity}, Price/Unit={cost_per_unit:.2f}")
 
         # ---- CLICK SAVE ----
         save_button = page.locator("button.btn.btn-blue", has_text="Save")
         await save_button.wait_for(state="visible", timeout=5000)
+        print(f"[INFO] Clicking Save button...")
+        
         # Wait for navigation after click
         async with page.expect_navigation(wait_until="domcontentloaded"):
             await save_button.click()
 
-        print(f"[INFO] Saved changes and returned to cart page for barcode {barserial}.")
-
+        print(f"[INFO] Navigated back to cart page. Waiting 1 seconds...")
+        await page.wait_for_timeout(1000)  # Wait 4 seconds
+        
+        # ---- SELECT STANDARD PAYMENT METHOD ----
+        print(f"[INFO] Selecting Standard payment method...")
+        standard_select_button = page.locator('a.btn.btn-blue[href*="/method/update?method=Standard"]')
+        await standard_select_button.wait_for(state="visible", timeout=5000)
+        await standard_select_button.click()
+        await page.wait_for_load_state("networkidle")
+        print(f"[INFO] Standard payment method selected.")
+        
+        print(f"[INFO] Batch complete!\n")
+        
+        # Move to next batch
+        i = batch_end
 
 
 MAX_CART_ITEM_OPENS = 10  # set to None to open ALL units
@@ -537,6 +588,7 @@ async def stock_process_sales(page, csv_file):
                     return
 
             units = []  # list of tuples (barcode, cost_per_unit)
+            unique_barcodes_processed = set()
 
             # Helper to parse numbers as floats
             def parse_number(s, row_num):
@@ -553,6 +605,11 @@ async def stock_process_sales(page, csv_file):
                 if not barserial:
                     continue
 
+                # Check if we've hit the barcode limit
+                if MAX_CART_ITEM_OPENS is not None and barserial not in unique_barcodes_processed:
+                    if len(unique_barcodes_processed) >= MAX_CART_ITEM_OPENS:
+                        break  # stop processing new barcodes
+
                 quantity = parse_number(row.get("Quantity", "0"), i)
                 cost = parse_number(row.get("Cost", "0"), i)
 
@@ -561,12 +618,12 @@ async def stock_process_sales(page, csv_file):
 
                 cost_per_unit = cost / quantity if quantity else 0.0
 
-                # Subdivide quantity into 1-unit barcodes
+                # Add this barcode to our set
+                unique_barcodes_processed.add(barserial)
+
+                # Subdivide quantity into 1-unit barcodes (all units of this barcode)
                 for _ in range(int(quantity)):
-                    if MAX_CART_ITEM_OPENS is None or len(units) < MAX_CART_ITEM_OPENS:
-                        units.append((barserial, cost_per_unit))
-                    else:
-                        break  # stop once MAX_CART_ITEM_OPENS reached
+                    units.append((barserial, cost_per_unit))
 
             # Summarize for logging
             barcode_counts = Counter([b for b, _ in units])
@@ -589,11 +646,8 @@ async def stock_process_sales(page, csv_file):
         print(f"[ERROR] Failed to read CSV: {e}")
         return
 
-    # Process each unit individually with barcode + cost per unit
-    await open_cart_items_per_unit(page, units)
-
-
-
+    # Process units in batches of 20
+    await open_cart_items_per_unit(page, units, batch_size=20)
 
 
 async def main():
