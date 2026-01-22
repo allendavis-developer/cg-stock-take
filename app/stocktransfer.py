@@ -454,6 +454,15 @@ async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pd
     print("[INFO] PDF saved successfully.")
 
     
+PAYMENT_METHOD = "Bank Transfer"
+# examples:
+# "Cash"
+# "Card"
+# "Store Credit"
+# "Paypal"
+# "Amazon"
+# "Website"
+# "Ebay Direct"
 
 async def open_cart_items_per_unit(page, units, cart_id=46077, batch_size=20):
     """
@@ -554,7 +563,7 @@ async def open_cart_items_per_unit(page, units, cart_id=46077, batch_size=20):
             await save_button.click()
 
         print(f"[INFO] Navigated back to cart page. Waiting 1 seconds...")
-        await page.wait_for_timeout(1000)  # Wait 4 seconds
+        await page.wait_for_timeout(4000)  # Wait 4 seconds
         
         # ---- SELECT STANDARD PAYMENT METHOD ----
         print(f"[INFO] Selecting Standard payment method...")
@@ -563,14 +572,41 @@ async def open_cart_items_per_unit(page, units, cart_id=46077, batch_size=20):
         await standard_select_button.click()
         await page.wait_for_load_state("networkidle")
         print(f"[INFO] Standard payment method selected.")
-        
+                # ---- CALCULATE TOTAL FOR THIS BATCH (FROM DATA, NOT PAGE) ----
+        batch_total = 0.0
+        for barserial, costs in grouped_items.items():
+            quantity = len(costs)
+            cost_per_unit = costs[0]  # same assumption you already make
+            batch_total += quantity * cost_per_unit
+
+        print(f"[INFO] Batch {batch_num} total to be paid: £{batch_total:.2f}")
+
+        # ---- FILL PAYMENT METHOD AMOUNT ----
+        amount_str = f"{batch_total:.2f}"
+
+        print(f"[INFO] Paying £{amount_str} via {PAYMENT_METHOD}")
+
+        payment_input = page.locator(
+            f'div.form-group:has(label:has-text("{PAYMENT_METHOD}")) input'
+        )
+
+        await payment_input.wait_for(state="visible", timeout=5000)
+        await payment_input.fill(amount_str)
+
+
+
         print(f"[INFO] Batch complete!\n")
+
+        # ---- WAIT 5 SECONDS BEFORE NEXT BATCH ----
+        print("[INFO] Waiting 5 seconds before next batch...")
+        await page.wait_for_timeout(4000)  # 5000 ms = 5 seconds
+
         
         # Move to next batch
         i = batch_end
 
 
-MAX_CART_ITEM_OPENS = 10  # set to None to open ALL units
+MAX_CART_ITEM_OPENS = None  # set to None to open ALL units
 
 from collections import Counter, defaultdict
 
@@ -647,7 +683,7 @@ async def stock_process_sales(page, csv_file):
         return
 
     # Process units in batches of 20
-    await open_cart_items_per_unit(page, units, batch_size=20)
+    await open_cart_items_per_unit(page, units, batch_size=5)
 
 
 async def main():
