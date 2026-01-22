@@ -334,9 +334,17 @@ async def fetch_with_retry(page, url, max_retries=5, delay_on_rate_limit=30):
 
 
 # --- CONFIG FLAG ---
-TEST_FIRST_TOP_CATEGORY_ONLY = True  # Set False to explore all top-level categories
+TEST_FIRST_TOP_CATEGORY_ONLY = False  # Set False to explore all top-level categories
 
-async def explore_category(page, url, path=None, is_top_level=False):
+import csv
+import re
+import random
+
+MAX_CATEGORY_DEPTH = 0  # will track maximum category depth dynamically
+
+async def explore_category(page, url, path=None, is_top_level=False, top_category_name=None):
+    global MAX_CATEGORY_DEPTH
+
     if path is None:
         path = []
 
@@ -344,12 +352,12 @@ async def explore_category(page, url, path=None, is_top_level=False):
 
     response = await fetch_with_retry(page, url)
     if response is None:
-        print("[ERROR] Could not reach the sales page due to rate limiting.")
-        return
+        print("[ERROR] Could not reach the page due to rate limiting.")
+        return []
 
     if page.is_closed():
         print("[ERROR] Page was closed unexpectedly.")
-        return
+        return []
 
     table_type = await page.evaluate("""
         () => {
@@ -358,8 +366,9 @@ async def explore_category(page, url, path=None, is_top_level=False):
         }
     """)
 
+    rows_for_this_category = []
+
     if table_type is None:
-        # Check if table exists but contains only "No results"
         empty_table = await page.evaluate("""
             () => {
                 const td = document.querySelector('#stock-valuation-table > table > tbody > tr > td');
@@ -367,20 +376,25 @@ async def explore_category(page, url, path=None, is_top_level=False):
                 return /no/i.test(td.textContent.trim());
             }
         """)
-
         if empty_table:
-            print(f"[INFO] Empty table detected at {url}, adding category path only.")
-            # Add a row with empty leaf columns
             leaf_headers = ["Barserial", "Name", "Quantity", "Retail", "Cost", "VAT", "Net", "Total Margin", "Margin %"]
-            all_rows.append((path.copy(), [""] * len(leaf_headers)))
-        else:
-            print(f"[WARNING] No table found at {url}")
-        return
-
+            rows_for_this_category.append((path.copy(), [""] * len(leaf_headers)))
+        return rows_for_this_category
 
     if table_type.lower() == "barserial":
+        # scrape leaf table
         await scrape_leaf_table(page, path, url)
-        return
+        # scrape_leaf_table already appends to global all_rows; we'll collect local rows here too
+        local_rows = []
+        table_rows = await page.evaluate("""
+            () => Array.from(document.querySelectorAll('#stock-valuation-table > table > tbody > tr')).map(tr => {
+                return Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+            })
+        """)
+        for r in table_rows:
+            local_rows.append((path.copy(), r))
+        rows_for_this_category.extend(local_rows)
+        return rows_for_this_category
 
     # Category table: extract subcategories
     subcategories = await page.evaluate("""
@@ -398,41 +412,86 @@ async def explore_category(page, url, path=None, is_top_level=False):
     """)
 
     if not subcategories:
-        print(f"[WARNING] No subcategories found at {url}")
-        return
+        return rows_for_this_category
 
     for i, subcat in enumerate(subcategories):
-        # Only restrict at the top-level
+        # Only restrict at top-level for testing
         if is_top_level and TEST_FIRST_TOP_CATEGORY_ONLY and i > 0:
-            print("[INFO] TEST MODE: only exploring first top-level category, skipping the rest.")
             break
+        # For top-level, remember the category name
+        current_top = subcat["name"] if is_top_level else top_category_name
+        sub_rows = await explore_category(page, subcat["url"], path + [subcat["name"]],
+                                          is_top_level=False, top_category_name=current_top)
+        rows_for_this_category.extend(sub_rows)
 
-        # Recurse; all lower levels explored fully
-        await explore_category(page, subcat["url"], path + [subcat["name"]], is_top_level=False)
-
-
+    return rows_for_this_category
 
 async def stock_process(page):
     top_url = "https://nospos.com/reports/stock/category-valuation"
-    global MAX_CATEGORY_DEPTH, all_rows
 
-    # Recursively traverse and scrape
-    await explore_category(page, top_url, is_top_level=True)
+    # Load root page
+    await fetch_with_retry(page, top_url)
 
-    # Prepare CSV headers
-    category_headers = [f"Category Level {i+1}" for i in range(MAX_CATEGORY_DEPTH)]
-    leaf_headers = ["Barserial", "Name", "Quantity", "Retail", "Cost", "VAT", "Net", "Total Margin", "Margin %"]
-    headers = category_headers + leaf_headers
+    # Extract top-level categories
+    top_categories = await page.evaluate("""
+        () => {
+            const rows = document.querySelectorAll(
+                '#stock-valuation-table > table > tbody > tr'
+            );
+            return Array.from(rows).map(row => {
+                const link = row.querySelector('td:first-child a');
+                if (!link) return null;
+                return {
+                    name: link.textContent.trim(),
+                    url: link.href
+                };
+            }).filter(Boolean);
+        }
+    """)
 
-    # Write to CSV
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        for path, row in all_rows:
-            padded_path = path + [""] * (MAX_CATEGORY_DEPTH - len(path))
-            writer.writerow(padded_path + row)
+    print(f"[INFO] Found {len(top_categories)} top-level categories")
 
-    print(f"[INFO] Scraping complete. CSV saved as {CSV_FILE}")
+    for i, cat in enumerate(top_categories):
+        if TEST_FIRST_TOP_CATEGORY_ONLY and i > 0:
+            print("[INFO] TEST MODE: only processing first top-level category")
+            break
+
+        print(f"[TOP] Processing category: {cat['name']}")
+
+        rows = await explore_category(
+            page,
+            cat["url"],
+            path=[cat["name"]],
+            is_top_level=False
+        )
+
+        if not rows:
+            print(f"[WARNING] No data for category {cat['name']}")
+            continue
+
+        # Compute max depth for this category
+        max_depth = max(len(path) for path, _ in rows)
+
+        category_headers = [f"Category Level {i+1}" for i in range(max_depth)]
+        leaf_headers = [
+            "Barserial", "Name", "Quantity", "Retail",
+            "Cost", "VAT", "Net", "Total Margin", "Margin %"
+        ]
+
+        filename = re.sub(r'[^A-Za-z0-9_-]+', '_', cat["name"]) + ".csv"
+
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(category_headers + leaf_headers)
+
+            for path, row in rows:
+                padded_path = path + [""] * (max_depth - len(path))
+                writer.writerow(padded_path + row)
+
+        print(f"[INFO] Saved CSV: {filename}")
+
+    print("[INFO] All top-level categories processed.")
+
 
 
 async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pdf"):
