@@ -17,6 +17,9 @@ os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(LOCAL_BROWSERS_DIR)
 
 # Add local packages to Python path
 sys.path.insert(0, str(LOCAL_PACKAGES_DIR))
+HOME_URL = "https://nospos.com"
+SALE_BUTTON_SELECTOR = 'a.btn.btn-massive.btn-massive-outline[href="/newsales/cart/create"]'
+
 
 def bootstrap_pip():
     print("[INFO] Bootstrapping pip using get-pip.py...")
@@ -523,33 +526,47 @@ PAYMENT_METHOD = "Bank Transfer"
 # "Website"
 # "Ebay Direct"
 
-async def open_cart_items_per_unit(page, units, cart_id=46077, batch_size=20):
-    """
-    units: list of tuples (barcode, cost_per_unit)
-    batch_size: number of items to add to cart before updating price
-    """
-    base_url = f"https://nospos.com/newsales/cart/{cart_id}/items"
-    update_url = f"https://nospos.com/newsales/cart/{cart_id}/items/update"
+async def open_cart_items_per_unit(page, units, batch_size=20):
+    import re
+    from collections import defaultdict
 
     i = 0
     while i < len(units):
-        # Calculate batch end index
         batch_end = min(i + batch_size, len(units))
         batch = units[i:batch_end]
         batch_num = (i // batch_size) + 1
-        
+
         print(f"\n[INFO] Processing batch {batch_num}: items {i+1} to {batch_end} of {len(units)}")
 
-        # Navigate to cart page
-        response = await fetch_with_retry(page, base_url)
-        if response is None:
-            print("[ERROR] Failed to load cart page.")
+        # ---- GO TO HOMEPAGE ----
+        await fetch_with_retry(page, HOME_URL)
+        await page.wait_for_load_state("networkidle")
+
+        # ---- CLICK SALE ----
+        sale_button = page.locator(SALE_BUTTON_SELECTOR)
+        await sale_button.wait_for(state="visible", timeout=5000)
+
+        async with page.expect_navigation(wait_until="networkidle"):
+            await sale_button.click()
+
+        print("[INFO] Entered Sales cart via Sale button.")
+
+        # ---- EXTRACT CART ID (PER BATCH) ----
+        current_url = page.url
+        match = re.search(r"/cart/(\d+)/items", current_url)
+
+        if not match:
+            print(f"[ERROR] Could not extract cart ID from URL: {current_url}")
             i = batch_end
             continue
 
-        await page.wait_for_load_state("networkidle")
+        cart_id = int(match.group(1))
+        print(f"[INFO] Batch {batch_num} using cart ID: {cart_id}")
 
-        # Clear cart before starting new batch
+        base_url = f"https://nospos.com/newsales/cart/{cart_id}/items"
+        update_url = f"https://nospos.com/newsales/cart/{cart_id}/items/update"
+
+        # ---- CLEAR CART ----
         clear_button = page.locator(
             f'a[href="/newsales/cart/{cart_id}/items/delete"]:has-text("Clear")'
         )
@@ -561,25 +578,21 @@ async def open_cart_items_per_unit(page, units, cart_id=46077, batch_size=20):
             await page.wait_for_load_state("networkidle")
             print("[INFO] Cart cleared.")
 
-        # Group batch items by barcode
-        from collections import defaultdict
+        # ---- GROUP ITEMS ----
         grouped_items = defaultdict(list)
         for barserial, cost_per_unit in batch:
             grouped_items[barserial].append(cost_per_unit)
-        
+
         print(f"[INFO] Batch has {len(grouped_items)} unique barcodes")
 
-        # Add each unique barcode once to the cart
+        # ---- ADD ITEMS ----
         barcode_input = page.locator("#stocksearch-search_barserial")
-        
-        for barserial in grouped_items.keys():
-            quantity = len(grouped_items[barserial])
-            print(f"[INFO] Adding barcode {barserial} (will have quantity {quantity})")
-            
-            await barcode_input.wait_for(state="visible", timeout=5000)
+
+        for barserial in grouped_items:
             await barcode_input.fill(barserial)
             await barcode_input.press("Enter")
             await page.wait_for_load_state("networkidle")
+
 
         # ---- GO TO UPDATE/DISCOUNT PAGE ----
         await page.goto(update_url)
