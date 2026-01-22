@@ -453,10 +453,78 @@ async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pd
     await page.close()
     print("[INFO] PDF saved successfully.")
 
+    
+
+async def open_cart_items_per_unit(page, units, cart_id=46065):
+    """
+    units: list of tuples (barcode, cost_per_unit)
+    """
+    base_url = f"https://nospos.com/newsales/cart/{cart_id}/items"
+    update_url = f"https://nospos.com/newsales/cart/{cart_id}/items/update"
+
+    for i, (barserial, cost_per_unit) in enumerate(units, start=1):
+        print(f"[INFO] Unit {i}/{len(units)}: processing barcode {barserial} with cost {cost_per_unit:.2f}")
+
+        response = await fetch_with_retry(page, base_url)
+        if response is None:
+            print("[ERROR] Failed to load cart page.")
+            continue
+
+        await page.wait_for_load_state("networkidle")
+
+        clear_button = page.locator(
+            f'a[href="/newsales/cart/{cart_id}/items/delete"]:has-text("Clear")'
+        )
+
+        if await clear_button.count() > 0 and await clear_button.first.is_visible():
+            await clear_button.click()
+            await page.wait_for_selector("button.swal2-confirm", timeout=5000)
+            await page.click("button.swal2-confirm")
+            await page.wait_for_load_state("networkidle")
+            print("[INFO] Cart cleared.")
+
+        # ---- ENTER BARCODE ----
+        barcode_input = page.locator("#stocksearch-search_barserial")
+        await barcode_input.wait_for(state="visible", timeout=5000)
+        await barcode_input.fill(barserial)
+        await barcode_input.press("Enter")
+        await page.wait_for_load_state("networkidle")
+        print(f"[INFO] Barcode {barserial} entered.")
+
+        # ---- GO TO UPDATE/DISCOUNT PAGE ----
+        await page.goto(update_url)
+        await page.wait_for_load_state("networkidle")
+        print(f"[INFO] On update page for barcode {barserial}.")
+
+        # ---- ENTER PRICE ----
+        price_input = page.locator("#cartitems-0-price")
+        await price_input.wait_for(state="visible", timeout=5000)
+        await price_input.fill(f"{cost_per_unit:.2f}")
+        print(f"[INFO] Entered price: {cost_per_unit:.2f}")
+
+        # ---- ENTER DISCOUNT REASON ----
+        discount_input = page.locator("#cartitems-0-discount_reason")
+        await discount_input.wait_for(state="visible", timeout=5000)
+        await discount_input.fill("testing")
+        print(f"[INFO] Entered discount reason: testing")
+
+        # ---- CLICK SAVE ----
+        save_button = page.locator("button.btn.btn-blue", has_text="Save")
+        await save_button.wait_for(state="visible", timeout=5000)
+        # Wait for navigation after click
+        async with page.expect_navigation(wait_until="domcontentloaded"):
+            await save_button.click()
+
+        print(f"[INFO] Saved changes and returned to cart page for barcode {barserial}.")
+
+
+
+MAX_CART_ITEM_OPENS = 10  # set to None to open ALL units
+
+from collections import Counter, defaultdict
 
 async def stock_process_sales(page, csv_file):
-    """Read CSV, log Barserial, Quantity, Cost, and Cost per unit.
-       Subdivide rows with Quantity > 1 into exact 1-unit rows for logging purposes."""
+    """Read CSV, log barcodes grouped, and process units individually with cost per unit."""
     
     print(f"[INFO] Reading sales CSV: {csv_file}")
     try:
@@ -468,38 +536,51 @@ async def stock_process_sales(page, csv_file):
                     print(f"[WARNING] CSV does not contain a '{col}' column.")
                     return
 
-            barserials = []
+            units = []  # list of tuples (barcode, cost_per_unit)
 
+            # Helper to parse numbers as floats
+            def parse_number(s, row_num):
+                s_clean = s.replace("£", "").replace(",", "").strip()
+                try:
+                    return float(s_clean)
+                except ValueError:
+                    print(f"[WARNING] Invalid number '{s}' at row {row_num}, defaulting to 0.")
+                    return 0.0
+
+            # Process CSV and build units
             for i, row in enumerate(reader, start=1):
                 barserial = row.get("Barserial", "").strip()
-                quantity_str = row.get("Quantity", "0").strip()
-                cost_str = row.get("Cost", "0").strip()
+                if not barserial:
+                    continue
 
-                # Helper to parse numbers
-                def parse_number(s):
-                    s_clean = re.sub(r"[£,]", "", s)
-                    try:
-                        return float(s_clean)
-                    except ValueError:
-                        print(f"[WARNING] Invalid number '{s}' at row {i}, defaulting to 0.")
-                        return 0.0
+                quantity = parse_number(row.get("Quantity", "0"), i)
+                cost = parse_number(row.get("Cost", "0"), i)
 
-                quantity = parse_number(quantity_str)
-                cost = parse_number(cost_str)
+                if quantity <= 0:
+                    continue
 
-                # Calculate cost per unit
-                cost_per_unit = cost / quantity if quantity != 0 else 0
+                cost_per_unit = cost / quantity if quantity else 0.0
 
-                # Handle subdivision if quantity > 1
-                if quantity > 1:
-                    print(f"Row {i}: Barserial = {barserial}, Quantity = {quantity}, Cost = {cost}, Cost per unit = {cost_per_unit:.2f} (subdivided into {int(quantity)} rows)")
-                    for j in range(int(quantity)):
-                        print(f"  Subdivided Row {i}.{j+1}: Barserial = {barserial}, Quantity = 1, Cost = {cost_per_unit:.2f}")
-                else:
-                    print(f"Row {i}: Barserial = {barserial}, Quantity = {quantity}, Cost = {cost}, Cost per unit = {cost_per_unit:.2f}")
+                # Subdivide quantity into 1-unit barcodes
+                for _ in range(int(quantity)):
+                    if MAX_CART_ITEM_OPENS is None or len(units) < MAX_CART_ITEM_OPENS:
+                        units.append((barserial, cost_per_unit))
+                    else:
+                        break  # stop once MAX_CART_ITEM_OPENS reached
 
-                if barserial:
-                    barserials.append(barserial)
+            # Summarize for logging
+            barcode_counts = Counter([b for b, _ in units])
+            barcode_totals = defaultdict(float)
+            for b, c in units:
+                barcode_totals[b] += c
+
+            print(f"{'Barcode':<15} | {'Qty':>5} | {'Total Cost':>10} | {'Cost/Unit':>10}")
+            print("-"*60)
+            for barserial in barcode_counts:
+                qty = barcode_counts[barserial]
+                total_cost = barcode_totals[barserial]
+                cost_per_unit = total_cost / qty if qty else 0.0
+                print(f"{barserial:<15} | {qty:5} | {total_cost:10.2f} | {cost_per_unit:10.2f}")
 
     except FileNotFoundError:
         print(f"[ERROR] CSV file not found: {csv_file}")
@@ -508,12 +589,8 @@ async def stock_process_sales(page, csv_file):
         print(f"[ERROR] Failed to read CSV: {e}")
         return
 
-    # --- Navigate to the NOSPOS page ---
-    target_url = "https://nospos.com/newsales/cart/46064/view"
-    # await page.goto(target_url)
-    # await page.wait_for_load_state("networkidle")
-    
-    await save_receipt_pdf_in_context(page.context, "https://nospos.com/print/sale-receipt?id=46064")
+    # Process each unit individually with barcode + cost per unit
+    await open_cart_items_per_unit(page, units)
 
 
 
