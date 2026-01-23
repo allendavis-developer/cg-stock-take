@@ -539,29 +539,33 @@ async def stock_process(page):
 
 
 
-async def save_receipt_pdf_in_context(
-    context,
-    receipt_id
-):
+async def save_receipt_pdf_in_context(context, receipt_id, branch_name):
     receipt_url = f"https://nospos.com/print/sale-receipt?id={receipt_id}"
-    pdf_path = f"{receipt_id}.pdf"
+
+    safe_branch = re.sub(r'[^A-Za-z0-9_-]+', '_', branch_name)
+    os.makedirs(safe_branch, exist_ok=True)
+
+    pdf_path = os.path.join(safe_branch, f"{receipt_id}.pdf")
 
     page = await context.new_page()
     response = await fetch_with_retry(page, receipt_url)
     if response is None:
-        print(f"[ERROR] Could not navigate to {receipt_url} due to rate limiting.")
+        print(f"[ERROR] Could not navigate to {receipt_url}")
         await page.close()
         return
 
-    print(f"[INFO] Saving PDF to {pdf_path}")
+    print(f"[INFO] Saving receipt PDF to {pdf_path}")
+
     await page.pdf(
         path=pdf_path,
         format="A4",
         print_background=True,
         margin={"top": "10mm", "bottom": "10mm"}
     )
+
     await page.close()
     print("[INFO] PDF saved successfully.")
+
 
 
     
@@ -723,17 +727,22 @@ async def open_cart_items_per_unit(page, units, batch_size=20, finish_transactio
             await finish_button.click()
             await page.wait_for_load_state("networkidle")
             print(f"[INFO] Finish button clicked, transaction complete.")
-            
-            # ---- SAVE RECEIPT PDF ----
-            context = page.context
-            await save_receipt_pdf_in_context(context, cart_id)
         else:
             print(f"[INFO] Skipping Finish button (finish_transaction=False)")
         # ---------------------
-        
+        branch_name = await page.evaluate("""
+                () => {
+                    const el = document.querySelector(
+                        '#navbar-mobile-collapse > ul.nav.navbar-nav.action-links > li:nth-child(1) > a span'
+                    );
+                    return el ? el.textContent.trim() : 'Unknown Branch';
+                }
+            """)
+            
+        # ---- SAVE RECEIPT PDF ----
         context = page.context
-        await save_receipt_pdf_in_context(context, cart_id)
-
+        await save_receipt_pdf_in_context(context, cart_id, branch_name)
+        
         print(f"[INFO] Batch complete!\n")
 
         # ---- WAIT 5 SECONDS BEFORE NEXT BATCH ----
@@ -745,7 +754,7 @@ async def open_cart_items_per_unit(page, units, batch_size=20, finish_transactio
         i = batch_end
 
 
-MAX_CART_ITEM_OPENS = None  # set to None to open ALL units
+MAX_CART_ITEM_OPENS = 10  # set to None to open ALL units
 
 from collections import Counter, defaultdict
 
@@ -822,7 +831,7 @@ async def stock_process_sales(page, csv_file, finish_transaction=False):
         return
 
     # Process units in batches of 20, passing the finish_transaction flag
-    await open_cart_items_per_unit(page, units, batch_size=20, finish_transaction=finish_transaction)
+    await open_cart_items_per_unit(page, units, batch_size=5, finish_transaction=finish_transaction)
 
 
 async def main():
