@@ -109,9 +109,24 @@ import os
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(LOCAL_BROWSERS_DIR)
 
 from playwright.async_api import async_playwright
+SESSION_FILE = SCRIPT_DIR / "auth_session.json"
 
 
 async def wait_for_login(page):
+    if SESSION_FILE.exists():
+        print("[INFO] Loading saved session...")
+        try:
+            await page.context.storage_state(path=str(SESSION_FILE))
+            await page.goto("https://nospos.com/stock/search")
+            await page.wait_for_load_state("networkidle")
+            
+            if "login" not in page.url:
+                print("[INFO] Session restored successfully!")
+                return True
+        except:
+            print("[INFO] Session expired, need to login again")
+
+
     print("[INFO] Navigating to NOSPOS...")
     await page.goto("https://nospos.com/stock/search")
     await page.wait_for_load_state("networkidle")
@@ -143,12 +158,17 @@ async def wait_for_login(page):
 
         if logged_in:
             print("[INFO] Login confirmed. You're inside NOSPOS.")
+                
+            # Save session after successful login
+            await page.context.storage_state(path=str(SESSION_FILE))
+            print("[INFO] Session saved for future use")
             return True
 
         await asyncio.sleep(1)
         checks += 1
 
     print("[ERROR] Timeout waiting for login to finish.")
+    
     return False
 
 
@@ -434,6 +454,19 @@ async def stock_process(page):
 
     # Load root page
     await fetch_with_retry(page, top_url)
+    
+    # Extract shop name
+    shop_name = await page.evaluate("""
+        () => {
+            const el = document.querySelector('a[href="#select-branch-modal"] span');
+            return el ? el.textContent.trim() : "UnknownShop";
+        }
+    """)
+    # Sanitize folder name
+    shop_folder = re.sub(r'[^A-Za-z0-9_-]+', '_', shop_name)
+    os.makedirs(shop_folder, exist_ok=True)
+    print(f"[INFO] Saving CSVs under folder: {shop_folder}")
+
 
     # Extract top-level categories
     top_categories = await page.evaluate("""
@@ -481,9 +514,15 @@ async def stock_process(page):
             "Cost", "VAT", "Net", "Total Margin", "Margin %"
         ]
 
-        filename = re.sub(r'[^A-Za-z0-9_-]+', '_', cat["name"]) + ".csv"
+        # Create CSV file path under shop folder
+        filename = os.path.join(
+            shop_folder,
+            re.sub(r'[^A-Za-z0-9_-]+', '_', cat["name"]) + ".csv"
+        )
 
-        with open(filename, "w", newline="", encoding="utf-8") as f:
+        tmp_filename = filename + ".tmp"
+
+        with open(tmp_filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(category_headers + leaf_headers)
 
@@ -491,13 +530,22 @@ async def stock_process(page):
                 padded_path = path + [""] * (max_depth - len(path))
                 writer.writerow(padded_path + row)
 
+        # Atomic replace — Excel-safe
+        os.replace(tmp_filename, filename)
+
         print(f"[INFO] Saved CSV: {filename}")
 
     print("[INFO] All top-level categories processed.")
 
 
 
-async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pdf"):
+async def save_receipt_pdf_in_context(
+    context,
+    receipt_id
+):
+    receipt_url = f"https://nospos.com/print/sale-receipt?id={receipt_id}"
+    pdf_path = f"{receipt_id}.pdf"
+
     page = await context.new_page()
     response = await fetch_with_retry(page, receipt_url)
     if response is None:
@@ -515,6 +563,7 @@ async def save_receipt_pdf_in_context(context, receipt_url, pdf_path="receipt.pd
     await page.close()
     print("[INFO] PDF saved successfully.")
 
+
     
 PAYMENT_METHOD = "Bank Transfer"
 # examples:
@@ -526,7 +575,7 @@ PAYMENT_METHOD = "Bank Transfer"
 # "Website"
 # "Ebay Direct"
 
-async def open_cart_items_per_unit(page, units, batch_size=20):
+async def open_cart_items_per_unit(page, units, batch_size=20, finish_transaction=False):
     import re
     from collections import defaultdict
 
@@ -666,6 +715,24 @@ async def open_cart_items_per_unit(page, units, batch_size=20):
         await payment_input.fill(amount_str)
 
 
+        # ---- PRESS FINISH BUTTON (IF ENABLED) ----
+        if finish_transaction:
+            print(f"[INFO] Clicking Finish button...")
+            finish_button = page.locator('button.btn.btn-blue:has-text("Finish")')
+            await finish_button.wait_for(state="visible", timeout=5000)
+            await finish_button.click()
+            await page.wait_for_load_state("networkidle")
+            print(f"[INFO] Finish button clicked, transaction complete.")
+            
+            # ---- SAVE RECEIPT PDF ----
+            context = page.context
+            await save_receipt_pdf_in_context(context, cart_id)
+        else:
+            print(f"[INFO] Skipping Finish button (finish_transaction=False)")
+        # ---------------------
+        
+        context = page.context
+        await save_receipt_pdf_in_context(context, cart_id)
 
         print(f"[INFO] Batch complete!\n")
 
@@ -682,7 +749,7 @@ MAX_CART_ITEM_OPENS = None  # set to None to open ALL units
 
 from collections import Counter, defaultdict
 
-async def stock_process_sales(page, csv_file):
+async def stock_process_sales(page, csv_file, finish_transaction=False):
     """Read CSV, log barcodes grouped, and process units individually with cost per unit."""
     
     print(f"[INFO] Reading sales CSV: {csv_file}")
@@ -754,23 +821,31 @@ async def stock_process_sales(page, csv_file):
         print(f"[ERROR] Failed to read CSV: {e}")
         return
 
-    # Process units in batches of 20
-    await open_cart_items_per_unit(page, units, batch_size=20)
+    # Process units in batches of 20, passing the finish_transaction flag
+    await open_cart_items_per_unit(page, units, batch_size=20, finish_transaction=finish_transaction)
 
 
 async def main():
     if len(sys.argv) < 2:
         print("[ERROR] Missing mode.")
         print("Usage:")
-        print("  python script.py take <TAKE_ID>")
-        print("  python script.py stock_process")
-        print("  python script.py stock_process_sales <CSV_FILE>")
+        print("  run.bat take <TAKE_ID>")
+        print("  run.bat stock_process")
+        print("  run.bat stock_process_sales <CSV_FILE> --save to save transactions.")
+        print("  run.bat stock_process_sales <CSV_FILE> to put it through without saving. This will still print a receipt so you can view if the transaction was set up right.")
         return
 
     mode = sys.argv[1].lower()
 
     take_id = None
     csv_file = None
+    finish_transaction = False  # Default to False
+    
+    # Check for --save flag
+    if "--save" in sys.argv:
+        finish_transaction = True
+        print("[INFO] --save flag detected: transactions will be finished and saved.")
+    
     if mode == "take":
         if len(sys.argv) < 3:
             print("[ERROR] TAKE mode requires a TAKE ID.")
@@ -789,12 +864,19 @@ async def main():
 
     async with async_playwright() as pw:
         print("[INFO] Launching browser...")
-        browser = await pw.chromium.launch_persistent_context(
-            USER_DATA_DIR,
+        browser = await pw.chromium.launch(
             headless=False,
             args=["--start-maximized"]
         )
-        page = await browser.new_page()
+        
+        # Create context with saved state if it exists
+        if SESSION_FILE.exists():
+            context = await browser.new_context(storage_state=str(SESSION_FILE))
+        else:
+            context = await browser.new_context()
+        
+        page = await context.new_page()
+
 
         # Wait for login first
         logged_in = await wait_for_login(page)
@@ -803,14 +885,13 @@ async def main():
 
         # After login
         if csv_file:
-            await stock_process_sales(page, csv_file)
+            await stock_process_sales(page, csv_file, finish_transaction)
         if mode == "take":
             await navigate_to_take(page, take_id)
         elif mode == "stock_process":
             await stock_process(page)
 
         print("[INFO] Done.")
-
 
 
 if __name__ == "__main__":
