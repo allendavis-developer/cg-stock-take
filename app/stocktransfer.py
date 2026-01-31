@@ -142,7 +142,7 @@ async def wait_for_login(page):
 
     print("[INFO] Waiting for NOSPOS to finish redirects...")
 
-    max_checks = 60
+    max_checks = 120
     checks = 0
 
     while checks < max_checks:
@@ -674,7 +674,7 @@ async def open_cart_items_per_unit(page, units, batch_size=20, finish_transactio
             # Update discount reason
             discount_input = page.locator(f"#cartitems-{idx}-discount_reason")
             await discount_input.wait_for(state="visible", timeout=5000)
-            await discount_input.fill("testing")
+            await discount_input.fill(".")
             
             print(f"[INFO] Set item {idx}: Qty={quantity}, Price/Unit={cost_per_unit:.2f}")
 
@@ -754,7 +754,7 @@ async def open_cart_items_per_unit(page, units, batch_size=20, finish_transactio
         i = batch_end
 
 
-MAX_CART_ITEM_OPENS = 10  # set to None to open ALL units
+MAX_CART_ITEM_OPENS = None  # set to None to open ALL units
 
 from collections import Counter, defaultdict
 
@@ -834,6 +834,157 @@ async def stock_process_sales(page, csv_file, finish_transaction=False):
     await open_cart_items_per_unit(page, units, batch_size=20, finish_transaction=finish_transaction)
 
 
+async def process_refunds(page, receipt_ids):
+    """Process refunds for a list of receipt IDs.
+    For each receipt, navigates to the refund page and fills out refund forms for all items.
+    """
+    for receipt_id in receipt_ids:
+        url = f"https://nospos.com/newsales/cart/{receipt_id}/add-refund"
+        print(f"\n[INFO] Processing refunds for receipt ID: {receipt_id}")
+        print(f"[INFO] Navigating to: {url}")
+        
+        try:
+            await page.goto(url, wait_until="networkidle")
+            await asyncio.sleep(1)  # Brief pause for page to fully render
+            
+            # Find all refund cards on the page
+            cards = await page.query_selector_all('.card')
+            print(f"[INFO] Found {len(cards)} card(s) on the page")
+            
+            for card_index, card in enumerate(cards, start=1):
+                print(f"\n[INFO] Processing card {card_index}/{len(cards)}")
+                
+                try:
+                    # Extract and set refund amount
+                    refund_amount_input = await card.query_selector('input[name*="refund_amount"]')
+                    if refund_amount_input:
+                        # Get the hint text to extract the total refundable amount
+                        hint = await card.query_selector('.help-block-hint')
+                        if hint:
+                            hint_text = await hint.inner_text()
+                            # Parse "£0 / £15 Refunded" to get 15
+                            import re
+                            match = re.search(r'£[\d,]+\.?\d*\s*/\s*£([\d,]+\.?\d*)', hint_text)
+                            if match:
+                                refund_amount = match.group(1).replace(',', '')
+                                await refund_amount_input.fill(refund_amount)
+                                print(f"  [✓] Set refund amount to: £{refund_amount}")
+                    
+                    # Set refund method to "Bank Transfer"
+                    refund_method_select = await card.query_selector('select[name*="refund_method"]')
+                    if refund_method_select:
+                        # Try to select "Bank Transfer"
+                        try:
+                            await refund_method_select.select_option(value="bank-transfer")
+                            print(f"  [✓] Set refund method to: Bank Transfer")
+                        except Exception as e:
+                            print(f"  [WARNING] Could not select 'Bank Transfer': {e}")
+                            print(f"  [INFO] Skipping to next card")
+                            continue
+                    
+                    # Set return to free quantity
+                    freestock_input = await card.query_selector('input[name*="freestock_quantity"]')
+                    if freestock_input:
+                        # Get the hint text to extract the returnable quantity
+                        freestock_hint = await card.query_selector('label[for*="freestock_quantity"] ~ .help-block-hint')
+                        if not freestock_hint:
+                            freestock_hint = await freestock_input.evaluate('el => el.parentElement.querySelector(".help-block-hint")')
+                        
+                        if freestock_hint:
+                            hint_text = await freestock_hint.inner_text() if hasattr(freestock_hint, 'inner_text') else await page.evaluate('el => el.textContent', freestock_hint)
+                            # Parse "0 / 1 Returned" to get 1
+                            match = re.search(r'(\d+)\s*/\s*(\d+)\s*Returned', hint_text)
+                            if match:
+                                return_qty = match.group(2)
+                                await freestock_input.fill(return_qty)
+                                print(f"  [✓] Set return to free qty to: {return_qty}")
+                    
+                    # Set return to faulty quantity to 0
+                    faulty_input = await card.query_selector('input[name*="faulty_quantity"]')
+                    if faulty_input:
+                        await faulty_input.fill('0')
+                        print(f"  [✓] Set return to faulty qty to: 0")
+                    
+                    # Set reason to "."
+                    reason_input = await card.query_selector('input[name*="reason"]')
+                    if reason_input:
+                        await reason_input.fill('...')
+                        print(f"  [✓] Set reason to: .")
+                    
+                    print(f"[INFO] Successfully processed card {card_index}")
+                    
+                except Exception as card_error:
+                    print(f"  [ERROR] Failed to process card {card_index}: {card_error}")
+                    continue
+            
+            print(f"\n[INFO] Completed processing all cards for receipt ID: {receipt_id}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to process receipt ID {receipt_id}: {e}")
+            continue
+    
+    print(f"\n[INFO] Finished processing all {len(receipt_ids)} receipt(s)")
+
+
+async def process_refunds_from_file(page, file_path):
+    """Read receipt IDs from a file and process refunds for each.
+    
+    Args:
+        page: Playwright page object
+        file_path: Path to text file containing receipt IDs (one per line)
+    """
+    
+    print(f"[INFO] Reading receipt IDs from: {file_path}")
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Parse receipt IDs from file
+        receipt_ids = []
+        for line_num, line in enumerate(lines, start=1):
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+            
+            # Try to parse as integer
+            try:
+                receipt_id = int(line)
+                receipt_ids.append(receipt_id)
+            except ValueError:
+                print(f"[WARNING] Line {line_num}: '{line}' is not a valid number, skipping")
+                continue
+        
+        print(f"[INFO] Found {len(receipt_ids)} valid receipt ID(s)")
+        
+        if not receipt_ids:
+            print("[ERROR] No valid receipt IDs found in file")
+            return
+        
+        # Display the receipt IDs that will be processed
+        print(f"[INFO] Receipt IDs to process: {receipt_ids}")
+        
+        # Process refunds for all receipt IDs
+        await process_refunds(page, receipt_ids)
+        
+        # Wait at the end so user can verify
+        print("\n" + "="*60)
+        print("[INFO] Refund processing complete!")
+        print("[INFO] Please review the page to verify everything is correct.")
+        print("[INFO] Press Enter to continue...")
+        print("="*60)
+        input()
+        
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {file_path}")
+        return
+    except Exception as e:
+        print(f"[ERROR] Failed to read file: {e}")
+        return
+    
+
 async def main():
     if len(sys.argv) < 2:
         print("[ERROR] Missing mode.")
@@ -842,12 +993,14 @@ async def main():
         print("  run.bat stock_process")
         print("  run.bat stock_process_sales <CSV_FILE> --save to save transactions.")
         print("  run.bat stock_process_sales <CSV_FILE> to put it through without saving. This will still print a receipt so you can view if the transaction was set up right.")
+        print("  run.bat process_refunds <RECEIPT_IDS_FILE>")
         return
 
     mode = sys.argv[1].lower()
 
     take_id = None
     csv_file = None
+    refunds_file = None
     finish_transaction = False  # Default to False
     
     # Check for --save flag
@@ -867,6 +1020,11 @@ async def main():
             print("[ERROR] stock_process_sales mode requires a CSV file path.")
             return
         csv_file = sys.argv[2]
+    elif mode == "process_refunds":
+        if len(sys.argv) < 3:
+            print("[ERROR] process_refunds mode requires a receipt IDs file path.")
+            return
+        refunds_file = sys.argv[2]
     else:
         print(f"[ERROR] Unknown mode: {mode}")
         return
@@ -886,7 +1044,6 @@ async def main():
         
         page = await context.new_page()
 
-
         # Wait for login first
         logged_in = await wait_for_login(page)
         if not logged_in:
@@ -895,7 +1052,9 @@ async def main():
         # After login
         if csv_file:
             await stock_process_sales(page, csv_file, finish_transaction)
-        if mode == "take":
+        elif refunds_file:
+            await process_refunds_from_file(page, refunds_file)
+        elif mode == "take":
             await navigate_to_take(page, take_id)
         elif mode == "stock_process":
             await stock_process(page)
