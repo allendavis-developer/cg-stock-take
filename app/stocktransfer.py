@@ -881,8 +881,9 @@ async def process_refunds(page, receipt_ids):
                             print(f"  [✓] Set refund method to: Bank Transfer")
                         except Exception as e:
                             print(f"  [WARNING] Could not select 'Bank Transfer': {e}")
-                            print(f"  [INFO] Filling remaining fields - manual processing required")
+                            print(f"  [INFO] Skipping receipt {receipt_id} - Bank Transfer not available")
                             bank_transfer_unavailable = True
+                            break  # Exit the card loop
                     
                     # Set return to free quantity
                     freestock_input = await card.query_selector('input[name*="freestock_quantity"]')
@@ -919,38 +920,27 @@ async def process_refunds(page, receipt_ids):
                     print(f"  [ERROR] Failed to process card {card_index}: {card_error}")
                     continue
             
+            # If bank transfer was unavailable, skip to next receipt
+            if bank_transfer_unavailable:
+                print(f"[INFO] Skipping to next receipt due to Bank Transfer unavailability")
+                continue
+            
             print(f"\n[INFO] Completed processing all cards for receipt ID: {receipt_id}")
             
-            # If bank transfer was unavailable, wait for manual processing
-            if bank_transfer_unavailable:
-                print("\n" + "="*60)
-                print("[WARNING] Bank Transfer option was not available!")
-                print("[INFO] Please manually select the refund method and click Process")
-                print("[INFO] Waiting for you to click the Process button...")
-                print("="*60)
-                
-                # Wait for the page to navigate away (indicating Process was clicked)
-                try:
-                    await page.wait_for_url(lambda url: "/add-refund" not in url, timeout=300000)  # 5 minute timeout
-                    print("[✓] Process button clicked, moving to next receipt")
-                except Exception as timeout_error:
-                    print(f"[ERROR] Timeout waiting for manual processing: {timeout_error}")
-            else:
-                # Auto-click Process button if bank transfer was successful
-                await asyncio.sleep(4)
-                print(f"\n[INFO] Clicking Process button...")
-                try:
-                    # Find button that contains "Process" text
-                    process_button = await page.query_selector('button.btn.btn-blue:has-text("Process")')
-                    if process_button:
-                        await process_button.click()
-                        print(f"  [✓] Process button clicked")
-                        await asyncio.sleep(2)  # Wait for submission to complete
-                    else:
-                        print(f"  [WARNING] Process button not found")
-                except Exception as button_error:
-                    print(f"  [ERROR] Failed to click Process button: {button_error}")
-                pass
+            # Wait 4 seconds then click the Process button
+            await asyncio.sleep(4)
+            print(f"\n[INFO] Clicking Process button...")
+            try:
+                # Find button that contains "Process" text
+                process_button = await page.query_selector('button.btn.btn-blue:has-text("Process")')
+                if process_button:
+                    await process_button.click()
+                    print(f"  [✓] Process button clicked")
+                    await asyncio.sleep(2)  # Wait for submission to complete
+                else:
+                    print(f"  [WARNING] Process button not found")
+            except Exception as button_error:
+                print(f"  [ERROR] Failed to click Process button: {button_error}")
             
         except Exception as e:
             print(f"[ERROR] Failed to process receipt ID {receipt_id}: {e}")
