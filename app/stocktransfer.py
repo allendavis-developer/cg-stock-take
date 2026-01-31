@@ -936,7 +936,11 @@ async def process_refunds(page, receipt_ids):
                 if process_button:
                     await process_button.click()
                     print(f"  [✓] Process button clicked")
-                    await asyncio.sleep(2)  # Wait for submission to complete
+                    # Wait for navigation to the view page
+                    view_url = f"https://nospos.com/newsales/cart/{receipt_id}/view"
+                    await page.wait_for_url(view_url, timeout=10000)
+                    print(f"  [✓] Navigated to view page")
+                    await asyncio.sleep(1)
                 else:
                     print(f"  [WARNING] Process button not found")
             except Exception as button_error:
@@ -947,7 +951,6 @@ async def process_refunds(page, receipt_ids):
             continue
     
     print(f"\n[INFO] Finished processing all {len(receipt_ids)} receipt(s)")
-
 
 async def process_refunds_from_file(page, file_path):
     """Read receipt IDs from a file and process refunds for each.
